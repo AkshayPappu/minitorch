@@ -8,6 +8,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # --- Library ---
 add_library(minitorch
     src/tensor.cpp
+    src/nn.cpp
+    src/optim.cpp
 )
 
 target_include_directories(minitorch
@@ -40,3 +42,6 @@ target_link_libraries(minitorch_tests
 
 include(GoogleTest)
 gtest_discover_tests(minitorch_tests)
+
+# --- Examples ---
+add_subdirectory(examples/gpt)

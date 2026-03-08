@@ -1,6 +1,9 @@
 #include <minitorch/tensor.hpp>
+#include <minitorch/autograd.hpp>
 
 namespace minitorch {
+
+thread_local std::mt19937 Tensor::rng_(std::random_device{}());
 
 // ════════════════════════════════════════════════════════════════
 // Helpers
@@ -33,6 +36,31 @@ int Tensor::flat_index(std::initializer_list<int> indices) const {
         idx += (*it) * strides_[i];
     }
     return idx;
+}
+
+static bool any_requires_grad(const Tensor& a) {
+    return a.requires_grad();
+}
+
+static bool any_requires_grad(const Tensor& a, const Tensor& b) {
+    return a.requires_grad() || b.requires_grad();
+}
+
+Edge make_edge(const Tensor& t) {
+    if (t.grad_fn()) {
+        return {t.grad_fn(), 0};
+    }
+    if (t.requires_grad()) {
+        if (!t.accumulate_grad_) {
+            if (!t.grad_holder_)
+                const_cast<Tensor&>(t).grad_holder_ = std::make_shared<GradHolder>();
+            auto accum = std::make_shared<AccumulateGrad>();
+            accum->holder = t.grad_holder_;
+            const_cast<Tensor&>(t).accumulate_grad_ = accum;
+        }
+        return {t.accumulate_grad_, 0};
+    }
+    return {nullptr, 0};
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -68,7 +96,6 @@ bool Tensor::is_empty() const {
     return false;
 }
 
-// Phase 1: Storage Access
 float* Tensor::data_ptr() const { return storage_.data_ptr() + offset_; }
 const Storage& Tensor::storage() const { return storage_; }
 void Tensor::set_storage(const Storage& s) { storage_ = s; }
@@ -158,6 +185,34 @@ Tensor Tensor::diag(const Tensor& tensor) {
     return t;
 }
 
+Tensor Tensor::randn(std::vector<int> shape) {
+    Tensor t(shape);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    float* p = t.data_ptr();
+    int n = t.numel();
+    for (int i = 0; i < n; ++i)
+        p[i] = dist(rng_);
+    return t;
+}
+
+Tensor Tensor::tril(int n, int diagonal) {
+    Tensor t = zeros({n, n});
+    float* p = t.data_ptr();
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j <= i + diagonal && j < n; ++j)
+            if (j >= 0) p[i * n + j] = 1.0f;
+    return t;
+}
+
+Tensor Tensor::triu(int n, int diagonal) {
+    Tensor t = zeros({n, n});
+    float* p = t.data_ptr();
+    for (int i = 0; i < n; ++i)
+        for (int j = std::max(0, i + diagonal); j < n; ++j)
+            p[i * n + j] = 1.0f;
+    return t;
+}
+
 // ════════════════════════════════════════════════════════════════
 // Phase 3: Indexing / Access
 // ════════════════════════════════════════════════════════════════
@@ -219,17 +274,36 @@ Tensor Tensor::view(std::vector<int> shape) const {
     Tensor t;
     t.storage_ = storage_;
     t.offset_ = offset_;
-    t.shape_ = std::move(shape);
+    t.shape_ = shape;
     t.strides_ = compute_strides(t.shape_);
     t.dtype_ = dtype_;
     t.device_ = device_;
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<ReshapeBackward>();
+        fn->self_shape = shape_;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
+    }
     return t;
 }
 
 Tensor Tensor::reshape(std::vector<int> shape) const {
-    if (is_contiguous())
+    if (is_contiguous()) {
         return view(std::move(shape));
-    return clone().view(std::move(shape));
+    }
+    Tensor t = clone();
+    t.shape_ = std::move(shape);
+    t.strides_ = compute_strides(t.shape_);
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<ReshapeBackward>();
+        fn->self_shape = shape_;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
+    }
+    return t;
 }
 
 Tensor Tensor::flatten() const {
@@ -248,6 +322,15 @@ Tensor Tensor::transpose(int dim0, int dim1) const {
     t.device_ = device_;
     std::swap(t.shape_[dim0], t.shape_[dim1]);
     std::swap(t.strides_[dim0], t.strides_[dim1]);
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<TransposeBackward>();
+        fn->dim0 = dim0;
+        fn->dim1 = dim1;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
+    }
     return t;
 }
 
@@ -264,6 +347,14 @@ Tensor Tensor::permute(std::vector<int> order) const {
     for (int i = 0; i < dim(); ++i) {
         t.shape_[i] = shape_[order[i]];
         t.strides_[i] = strides_[order[i]];
+    }
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<PermuteBackward>();
+        fn->order = order;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
     }
     return t;
 }
@@ -290,8 +381,13 @@ Tensor Tensor::squeeze(int d) const {
             t.strides_.push_back(strides_[i]);
         }
     }
-    if (t.shape_.empty() && !is_empty()) {
-        // scalar tensor
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<SqueezeBackward>();
+        fn->self_shape = shape_;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
     }
     return t;
 }
@@ -311,6 +407,14 @@ Tensor Tensor::unsqueeze(int d) const {
     if (d > 0 && d == dim()) stride_val = 1;
     t.shape_.insert(t.shape_.begin() + d, 1);
     t.strides_.insert(t.strides_.begin() + d, stride_val);
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<UnsqueezeBackward>();
+        fn->dim = d;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
+    }
     return t;
 }
 
@@ -341,6 +445,14 @@ Tensor Tensor::expand(std::vector<int> shape) const {
         } else {
             t.strides_[i] = 0;
         }
+    }
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<ExpandBackward>();
+        fn->self_shape = shape_;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
     }
     return t;
 }
@@ -379,6 +491,18 @@ Tensor Tensor::slice(int d, int start, int end, int step) const {
     t.strides_[d] = strides_[d] * step;
     t.dtype_ = dtype_;
     t.device_ = device_;
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<SliceBackward>();
+        fn->self_shape = shape_;
+        fn->dim = d;
+        fn->start = start;
+        fn->end = end;
+        fn->step = step;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
+    }
     return t;
 }
 
@@ -397,12 +521,30 @@ Tensor Tensor::select(int d, int index) const {
         t.shape_.push_back(shape_[i]);
         t.strides_.push_back(strides_[i]);
     }
+
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<SelectBackward>();
+        fn->self_shape = shape_;
+        fn->dim = d;
+        fn->index = index;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
+    }
     return t;
 }
 
 Tensor Tensor::contiguous() const {
     if (is_contiguous()) return *this;
-    return clone();
+    Tensor t = clone();
+    if (requires_grad_) {
+        t.requires_grad_ = true;
+        auto fn = std::make_shared<ReshapeBackward>();
+        fn->self_shape = shape_;
+        fn->add_next_edge(make_edge(*this));
+        t.grad_fn_ = fn;
+    }
+    return t;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -553,31 +695,236 @@ Tensor& Tensor::apply_binary_inplace(const Tensor& other, std::function<float(fl
     return *this;
 }
 
-// Phase 6: Elementwise Ops - Tensor-Tensor
-Tensor Tensor::add(const Tensor& o) const { return apply_binary(o, [](float a, float b) { return a + b; }); }
-Tensor Tensor::sub(const Tensor& o) const { return apply_binary(o, [](float a, float b) { return a - b; }); }
-Tensor Tensor::mul(const Tensor& o) const { return apply_binary(o, [](float a, float b) { return a * b; }); }
-Tensor Tensor::div(const Tensor& o) const { return apply_binary(o, [](float a, float b) { return a / b; }); }
+// Phase 6: Elementwise Ops with autograd
+
+Tensor Tensor::add(const Tensor& o) const {
+    Tensor result = apply_binary(o, [](float a, float b) { return a + b; });
+    if (any_requires_grad(*this, o)) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<AddBackward>();
+        fn->self_shape = shape_;
+        fn->other_shape = o.shape_;
+        fn->add_next_edge(make_edge(*this));
+        fn->add_next_edge(make_edge(o));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::sub(const Tensor& o) const {
+    Tensor result = apply_binary(o, [](float a, float b) { return a - b; });
+    if (any_requires_grad(*this, o)) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<SubBackward>();
+        fn->self_shape = shape_;
+        fn->other_shape = o.shape_;
+        fn->add_next_edge(make_edge(*this));
+        fn->add_next_edge(make_edge(o));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::mul(const Tensor& o) const {
+    Tensor result = apply_binary(o, [](float a, float b) { return a * b; });
+    if (any_requires_grad(*this, o)) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<MulBackward>();
+        fn->self = detach();
+        fn->other = o.detach();
+        fn->add_next_edge(make_edge(*this));
+        fn->add_next_edge(make_edge(o));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::div(const Tensor& o) const {
+    Tensor result = apply_binary(o, [](float a, float b) { return a / b; });
+    if (any_requires_grad(*this, o)) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<DivBackward>();
+        fn->self = detach();
+        fn->other = o.detach();
+        fn->add_next_edge(make_edge(*this));
+        fn->add_next_edge(make_edge(o));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
 Tensor Tensor::pow(const Tensor& o) const { return apply_binary(o, [](float a, float b) { return std::pow(a, b); }); }
 
-// Phase 6: Unary
-Tensor Tensor::neg() const     { return apply_unary([](float x) { return -x; }); }
-Tensor Tensor::exp() const     { return apply_unary([](float x) { return std::exp(x); }); }
-Tensor Tensor::log() const     { return apply_unary([](float x) { return std::log(x); }); }
-Tensor Tensor::sqrt() const    { return apply_unary([](float x) { return std::sqrt(x); }); }
-Tensor Tensor::abs() const     { return apply_unary([](float x) { return std::abs(x); }); }
-Tensor Tensor::relu() const    { return apply_unary([](float x) { return x > 0 ? x : 0.0f; }); }
-Tensor Tensor::sigmoid() const { return apply_unary([](float x) { return 1.0f / (1.0f + std::exp(-x)); }); }
-Tensor Tensor::tanh() const    { return apply_unary([](float x) { return std::tanh(x); }); }
+Tensor Tensor::neg() const {
+    Tensor result = apply_unary([](float x) { return -x; });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<NegBackward>();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
 
-// Phase 6: Scalar ops
-Tensor Tensor::add_scalar(float v) const { return apply_unary([v](float x) { return x + v; }); }
-Tensor Tensor::sub_scalar(float v) const { return apply_unary([v](float x) { return x - v; }); }
-Tensor Tensor::mul_scalar(float v) const { return apply_unary([v](float x) { return x * v; }); }
-Tensor Tensor::div_scalar(float v) const { return apply_unary([v](float x) { return x / v; }); }
-Tensor Tensor::pow_scalar(float v) const { return apply_unary([v](float x) { return std::pow(x, v); }); }
+Tensor Tensor::exp() const {
+    Tensor result = apply_unary([](float x) { return std::exp(x); });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<ExpBackward>();
+        fn->result = result.detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
 
-// Phase 6: In-place
+Tensor Tensor::log() const {
+    Tensor result = apply_unary([](float x) { return std::log(x); });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<LogBackward>();
+        fn->self = detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::sqrt() const {
+    Tensor result = apply_unary([](float x) { return std::sqrt(x); });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<SqrtBackward>();
+        fn->result = result.detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::abs() const {
+    Tensor result = apply_unary([](float x) { return std::abs(x); });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<AbsBackward>();
+        fn->self = detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::relu() const {
+    Tensor result = apply_unary([](float x) { return x > 0 ? x : 0.0f; });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<ReluBackward>();
+        fn->self = detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::sigmoid() const {
+    Tensor result = apply_unary([](float x) { return 1.0f / (1.0f + std::exp(-x)); });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<SigmoidBackward>();
+        fn->result = result.detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::tanh() const {
+    Tensor result = apply_unary([](float x) { return std::tanh(x); });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<TanhBackward>();
+        fn->result = result.detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::gelu() const {
+    static const float kSqrt2OverPi = std::sqrt(2.0f / 3.14159265358979323846f);
+    Tensor result = apply_unary([](float x) {
+        float inner = std::sqrt(2.0f / 3.14159265358979323846f) * (x + 0.044715f * x * x * x);
+        return 0.5f * x * (1.0f + std::tanh(inner));
+    });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<GELUBackward>();
+        fn->self = detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::add_scalar(float v) const {
+    Tensor result = apply_unary([v](float x) { return x + v; });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<AddScalarBackward>();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::sub_scalar(float v) const {
+    Tensor result = apply_unary([v](float x) { return x - v; });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<SubScalarBackward>();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::mul_scalar(float v) const {
+    Tensor result = apply_unary([v](float x) { return x * v; });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<MulScalarBackward>();
+        fn->scalar = v;
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::div_scalar(float v) const {
+    Tensor result = apply_unary([v](float x) { return x / v; });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<DivScalarBackward>();
+        fn->scalar = v;
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::pow_scalar(float v) const {
+    Tensor result = apply_unary([v](float x) { return std::pow(x, v); });
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<PowScalarBackward>();
+        fn->self = detach();
+        fn->scalar = v;
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
 Tensor& Tensor::add_(const Tensor& o) { return apply_binary_inplace(o, [](float a, float b) { return a + b; }); }
 Tensor& Tensor::sub_(const Tensor& o) { return apply_binary_inplace(o, [](float a, float b) { return a - b; }); }
 Tensor& Tensor::mul_(const Tensor& o) { return apply_binary_inplace(o, [](float a, float b) { return a * b; }); }
@@ -673,7 +1020,6 @@ Tensor Tensor::reduce_arg(int d, std::function<bool(float, float)> cmp) const {
 
     Tensor result(out_shape, 0.0f);
     Tensor best_vals(out_shape, 0.0f);
-    bool first_pass = true;
 
     int n = numel();
     std::vector<int> idx(dim(), 0);
@@ -709,13 +1055,31 @@ Tensor Tensor::reduce_arg(int d, std::function<bool(float, float)> cmp) const {
 }
 
 Tensor Tensor::sum(int d) const {
-    return reduce(d, [](float a, float b) { return a + b; }, 0.0f);
+    Tensor result = reduce(d, [](float a, float b) { return a + b; }, 0.0f);
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<SumBackward>();
+        fn->self_shape = shape_;
+        fn->dim = d;
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
 }
 
 Tensor Tensor::mean(int d) const {
     Tensor s = sum(d);
     float count = (d == -1) ? static_cast<float>(numel()) : static_cast<float>(shape_[d]);
-    return s.div_scalar(count);
+    Tensor result = s.detach().div_scalar(count);
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<MeanBackward>();
+        fn->self_shape = shape_;
+        fn->dim = d;
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
 }
 
 Tensor Tensor::max(int d) const {
@@ -734,6 +1098,24 @@ Tensor Tensor::argmin(int d) const {
     return reduce_arg(d, [](float a, float b) { return a < b; });
 }
 
+Tensor Tensor::variance(int d, bool unbiased) const {
+    Tensor m = mean(d);
+    Tensor diff;
+    if (d == -1) {
+        diff = sub(m.expand(shape_));
+    } else {
+        std::vector<int> expand_shape = shape_;
+        expand_shape[d] = 1;
+        Tensor m_unsq = m.reshape(expand_shape).expand(shape_);
+        diff = sub(m_unsq);
+    }
+    Tensor sq = diff.mul(diff);
+    Tensor s = sq.sum(d);
+    float count = (d == -1) ? static_cast<float>(numel()) : static_cast<float>(shape_[d]);
+    if (unbiased && count > 1) count -= 1.0f;
+    return s.detach().div_scalar(count);
+}
+
 // ════════════════════════════════════════════════════════════════
 // Phase 8: Comparison Ops
 // ════════════════════════════════════════════════════════════════
@@ -746,7 +1128,7 @@ Tensor Tensor::gt(const Tensor& o) const { return apply_binary(o, [](float a, fl
 Tensor Tensor::ge(const Tensor& o) const { return apply_binary(o, [](float a, float b) { return a >= b ? 1.0f : 0.0f; }); }
 
 // ════════════════════════════════════════════════════════════════
-// Phase 8: Linear Algebra
+// Phase 8: Linear Algebra (with autograd)
 // ════════════════════════════════════════════════════════════════
 
 Tensor Tensor::matmul(const Tensor& other) const {
@@ -787,6 +1169,16 @@ Tensor Tensor::mm(const Tensor& other) const {
         for (int k = 0; k < K; ++k)
             for (int j = 0; j < N; ++j)
                 C[i * N + j] += A[i * K + k] * B[k * N + j];
+
+    if (any_requires_grad(*this, other)) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<MmBackward>();
+        fn->self = a_c.detach();
+        fn->other = b_c.detach();
+        fn->add_next_edge(make_edge(*this));
+        fn->add_next_edge(make_edge(other));
+        result.grad_fn_ = fn;
+    }
     return result;
 }
 
@@ -809,6 +1201,16 @@ Tensor Tensor::bmm(const Tensor& other) const {
             for (int k = 0; k < K; ++k)
                 for (int j = 0; j < N; ++j)
                     C[i * N + j] += A[i * K + k] * B[k * N + j];
+    }
+
+    if (any_requires_grad(*this, other)) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<BmmBackward>();
+        fn->self = a_c.detach();
+        fn->other = b_c.detach();
+        fn->add_next_edge(make_edge(*this));
+        fn->add_next_edge(make_edge(other));
+        result.grad_fn_ = fn;
     }
     return result;
 }
@@ -875,6 +1277,20 @@ Tensor Tensor::cat(const std::vector<Tensor>& tensors, int d) {
         dst.copy_(t);
         offset += t.sizes()[d];
     }
+
+    bool need_grad = false;
+    for (const auto& t : tensors)
+        if (t.requires_grad()) { need_grad = true; break; }
+    if (need_grad) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<CatBackward>();
+        fn->dim = d;
+        for (const auto& t : tensors) {
+            fn->split_sizes.push_back(t.sizes()[d]);
+            fn->add_next_edge(make_edge(t));
+        }
+        result.grad_fn_ = fn;
+    }
     return result;
 }
 
@@ -909,22 +1325,220 @@ std::vector<Tensor> Tensor::chunk(int chunks, int d) const {
 }
 
 // ════════════════════════════════════════════════════════════════
+// New ops for GPT
+// ════════════════════════════════════════════════════════════════
+
+Tensor Tensor::softmax(int d) const {
+    if (d < 0) d += dim();
+    Tensor m = max(d);
+    std::vector<int> expand_shape = shape_;
+    expand_shape[d] = 1;
+    Tensor shifted = sub(m.reshape(expand_shape).expand(shape_));
+    Tensor e = shifted.detach().apply_unary([](float x) { return std::exp(x); });
+    Tensor s = e.sum(d);
+    Tensor result = e.apply_binary(s.reshape(expand_shape).expand(shape_),
+        [](float a, float b) { return a / b; });
+
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<SoftmaxBackward>();
+        fn->result = result.detach();
+        fn->dim = d;
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::log_softmax(int d) const {
+    if (d < 0) d += dim();
+    Tensor m = max(d);
+    std::vector<int> expand_shape = shape_;
+    expand_shape[d] = 1;
+    Tensor shifted = sub(m.reshape(expand_shape).expand(shape_)).detach();
+    Tensor e = shifted.apply_unary([](float x) { return std::exp(x); });
+    Tensor s = e.sum(d);
+    Tensor log_s = s.apply_unary([](float x) { return std::log(x); });
+    Tensor result = shifted.sub(log_s.reshape(expand_shape).expand(shape_));
+
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<LogSoftmaxBackward>();
+        fn->result = result.detach();
+        fn->dim = d;
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::masked_fill(const Tensor& mask, float value) const {
+    Tensor result = clone();
+    int n = result.numel();
+    float* dst = result.data_ptr();
+    Tensor mc = mask.contiguous();
+    const float* mp = mc.data_ptr();
+    Tensor sc = contiguous();
+    const float* sp = sc.data_ptr();
+    for (int i = 0; i < n; ++i)
+        dst[i] = (mp[i] != 0.0f) ? value : sp[i];
+
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<MaskedFillBackward>();
+        fn->mask = mask.detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::cross_entropy_loss(const Tensor& targets) const {
+    int N = shape_[0];
+    int C = shape_[1];
+    Tensor lsm = log_softmax(1).detach();
+
+    float loss = 0.0f;
+    Tensor tc = targets.contiguous();
+    const float* tp = tc.data_ptr();
+    for (int i = 0; i < N; ++i) {
+        int cls = static_cast<int>(tp[i]);
+        loss -= lsm.at({i, cls});
+    }
+    loss /= static_cast<float>(N);
+    Tensor result({1}, loss);
+
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<CrossEntropyBackward>();
+        fn->log_probs = lsm;
+        fn->targets = targets.detach();
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::embedding_lookup(const Tensor& indices) const {
+    int embed_dim = shape_[1];
+    std::vector<int> out_shape = indices.sizes();
+    out_shape.push_back(embed_dim);
+
+    Tensor result(out_shape);
+    Tensor ic = indices.contiguous();
+    const float* ip = ic.data_ptr();
+    Tensor wc = contiguous();
+    const float* wp = wc.data_ptr();
+    float* rp = result.data_ptr();
+
+    int n_indices = indices.numel();
+    for (int i = 0; i < n_indices; ++i) {
+        int idx = static_cast<int>(ip[i]);
+        std::memcpy(rp + i * embed_dim, wp + idx * embed_dim, embed_dim * sizeof(float));
+    }
+
+    if (requires_grad_) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<EmbeddingBackward>();
+        fn->indices = indices.detach();
+        fn->num_embeddings = shape_[0];
+        fn->add_next_edge(make_edge(*this));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::layer_norm(const Tensor& weight, const Tensor& bias, float eps) const {
+    int norm_dim = shape_.back();
+    int outer = numel() / norm_dim;
+
+    Tensor input_c = contiguous();
+    Tensor result(shape_);
+    Tensor mean_t({outer});
+    Tensor rstd_t({outer});
+
+    const float* inp = input_c.data_ptr();
+    float* out = result.data_ptr();
+    float* mp = mean_t.data_ptr();
+    float* rp = rstd_t.data_ptr();
+
+    Tensor wc = weight.contiguous();
+    Tensor bc = bias.contiguous();
+    const float* wp = wc.data_ptr();
+    const float* bp = bc.data_ptr();
+
+    for (int i = 0; i < outer; ++i) {
+        const float* row = inp + i * norm_dim;
+        float m = 0.0f;
+        for (int j = 0; j < norm_dim; ++j) m += row[j];
+        m /= norm_dim;
+        mp[i] = m;
+
+        float var = 0.0f;
+        for (int j = 0; j < norm_dim; ++j) {
+            float d = row[j] - m;
+            var += d * d;
+        }
+        var /= norm_dim;
+        float rs = 1.0f / std::sqrt(var + eps);
+        rp[i] = rs;
+
+        float* orow = out + i * norm_dim;
+        for (int j = 0; j < norm_dim; ++j)
+            orow[j] = (row[j] - m) * rs * wp[j] + bp[j];
+    }
+
+    if (any_requires_grad(*this, weight) || bias.requires_grad()) {
+        result.requires_grad_ = true;
+        auto fn = std::make_shared<LayerNormBackward>();
+        fn->self = input_c.detach();
+        fn->mean = mean_t;
+        fn->rstd = rstd_t;
+        fn->weight = weight.detach();
+        fn->normalized_dim = norm_dim;
+        fn->add_next_edge(make_edge(*this));
+        fn->add_next_edge(make_edge(weight));
+        fn->add_next_edge(make_edge(bias));
+        result.grad_fn_ = fn;
+    }
+    return result;
+}
+
+Tensor Tensor::dropout(float p, bool training) const {
+    if (!training || p == 0.0f) return *this;
+    Tensor mask(shape_);
+    int n = numel();
+    float* mp = mask.data_ptr();
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float scale = 1.0f / (1.0f - p);
+    for (int i = 0; i < n; ++i)
+        mp[i] = (dist(rng_) >= p) ? scale : 0.0f;
+    return mul(mask);
+}
+
+// ════════════════════════════════════════════════════════════════
 // Phase 9: Autograd
 // ════════════════════════════════════════════════════════════════
 
 bool Tensor::requires_grad() const { return requires_grad_; }
-void Tensor::set_requires_grad(bool req) { requires_grad_ = req; }
+void Tensor::set_requires_grad(bool req) {
+    requires_grad_ = req;
+    if (req && !grad_holder_)
+        grad_holder_ = std::make_shared<GradHolder>();
+}
 
 Tensor Tensor::grad() const {
-    if (!grad_) return Tensor();
-    return *grad_;
+    if (!grad_holder_ || !grad_holder_->grad) return Tensor();
+    return *grad_holder_->grad;
 }
 
 void Tensor::set_grad(const Tensor& g) {
-    grad_ = std::make_shared<Tensor>(g.clone());
+    if (!grad_holder_) grad_holder_ = std::make_shared<GradHolder>();
+    grad_holder_->grad = std::make_shared<Tensor>(g.clone());
 }
 
 std::shared_ptr<GradFunction> Tensor::grad_fn() const { return grad_fn_; }
+void Tensor::set_grad_fn(std::shared_ptr<GradFunction> fn) { grad_fn_ = std::move(fn); }
 
 void Tensor::backward() {
     backward(ones(shape_));
@@ -933,16 +1547,80 @@ void Tensor::backward() {
 void Tensor::backward(const Tensor& grad_output) {
     if (!requires_grad_)
         throw std::runtime_error("backward called on tensor that doesn't require grad");
-    if (!grad_) {
-        grad_ = std::make_shared<Tensor>(grad_output.clone());
+
+    std::vector<std::shared_ptr<GradFunction>> topo_order;
+    std::unordered_set<GradFunction*> visited;
+
+    // Iterative topological sort (post-order DFS)
+    {
+        struct Frame {
+            std::shared_ptr<GradFunction> fn;
+            size_t child_idx;
+        };
+        std::vector<Frame> stack;
+        if (grad_fn_ && !visited.count(grad_fn_.get())) {
+            visited.insert(grad_fn_.get());
+            stack.push_back({grad_fn_, 0});
+        }
+        while (!stack.empty()) {
+            auto& top = stack.back();
+            if (top.child_idx < top.fn->next_edges.size()) {
+                auto& edge = top.fn->next_edges[top.child_idx++];
+                if (edge.function && !visited.count(edge.function.get())) {
+                    visited.insert(edge.function.get());
+                    stack.push_back({edge.function, 0});
+                }
+            } else {
+                topo_order.push_back(top.fn);
+                stack.pop_back();
+            }
+        }
+    }
+
+    std::unordered_map<GradFunction*, Tensor> grad_map;
+    if (grad_fn_) {
+        grad_map[grad_fn_.get()] = grad_output.clone();
     } else {
-        grad_->add_(grad_output);
+        if (!grad_holder_) grad_holder_ = std::make_shared<GradHolder>();
+        if (!grad_holder_->grad) {
+            grad_holder_->grad = std::make_shared<Tensor>(grad_output.clone());
+        } else {
+            grad_holder_->grad->add_(grad_output);
+        }
+        return;
+    }
+
+    for (int i = static_cast<int>(topo_order.size()) - 1; i >= 0; --i) {
+        auto& fn = topo_order[i];
+        auto it = grad_map.find(fn.get());
+        if (it == grad_map.end()) continue;
+
+        Tensor current_grad = it->second;
+        std::vector<Tensor> input_grads = fn->apply({current_grad});
+
+        for (size_t j = 0; j < fn->next_edges.size() && j < input_grads.size(); ++j) {
+            auto& edge = fn->next_edges[j];
+            if (!edge.function) continue;
+
+            auto accum = std::dynamic_pointer_cast<AccumulateGrad>(edge.function);
+            if (accum) {
+                accum->apply({input_grads[j]});
+                continue;
+            }
+
+            auto git = grad_map.find(edge.function.get());
+            if (git == grad_map.end()) {
+                grad_map[edge.function.get()] = input_grads[j].clone();
+            } else {
+                git->second.add_(input_grads[j]);
+            }
+        }
     }
 }
 
 void Tensor::zero_grad() {
-    if (grad_)
-        grad_.reset();
+    if (grad_holder_ && grad_holder_->grad)
+        grad_holder_->grad.reset();
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1024,6 +1702,378 @@ Tensor Tensor::astype(DType dt) const {
 
 Tensor Tensor::pin_memory() const {
     return clone();
+}
+
+// ════════════════════════════════════════════════════════════════
+// Autograd backward implementations
+// ════════════════════════════════════════════════════════════════
+
+Tensor reduce_grad_for_broadcast(const Tensor& grad, const std::vector<int>& target_shape) {
+    Tensor g = grad.detach();
+    int target_dim = static_cast<int>(target_shape.size());
+
+    while (g.dim() > target_dim)
+        g = g.sum(0).detach();
+
+    for (int i = 0; i < target_dim; ++i) {
+        if (target_shape[i] == 1 && g.sizes()[i] != 1) {
+            g = g.sum(i).detach();
+            // sum removes the dimension; unsqueeze to restore it at position i
+            g = g.unsqueeze(i);
+        }
+    }
+    return g.reshape(target_shape);
+}
+
+std::vector<Tensor> AccumulateGrad::apply(const std::vector<Tensor>& grads) {
+    if (holder) {
+        if (!holder->grad) {
+            holder->grad = std::make_shared<Tensor>(grads[0].clone());
+        } else {
+            holder->grad->add_(grads[0]);
+        }
+    }
+    return {};
+}
+
+std::vector<Tensor> NegBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    return {g.neg()};
+}
+
+std::vector<Tensor> ExpBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    return {g.mul(result)};
+}
+
+std::vector<Tensor> LogBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    return {g.div(self)};
+}
+
+std::vector<Tensor> ReluBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor mask = self.apply_unary([](float x) { return x > 0 ? 1.0f : 0.0f; });
+    return {g.mul(mask)};
+}
+
+std::vector<Tensor> SigmoidBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor one_minus = result.apply_unary([](float x) { return 1.0f - x; });
+    return {g.mul(result).mul(one_minus)};
+}
+
+std::vector<Tensor> TanhBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor one_minus_sq = result.apply_unary([](float x) { return 1.0f - x * x; });
+    return {g.mul(one_minus_sq)};
+}
+
+std::vector<Tensor> SqrtBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor two_result = result.mul_scalar(2.0f);
+    return {g.div(two_result)};
+}
+
+std::vector<Tensor> AbsBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor sign = self.apply_unary([](float x) { return x > 0 ? 1.0f : (x < 0 ? -1.0f : 0.0f); });
+    return {g.mul(sign)};
+}
+
+std::vector<Tensor> AddBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor ga = reduce_grad_for_broadcast(g, self_shape);
+    Tensor gb = reduce_grad_for_broadcast(g, other_shape);
+    return {ga, gb};
+}
+
+std::vector<Tensor> SubBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor ga = reduce_grad_for_broadcast(g, self_shape);
+    Tensor gb = reduce_grad_for_broadcast(g.neg(), other_shape);
+    return {ga, gb};
+}
+
+std::vector<Tensor> MulBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor ga = reduce_grad_for_broadcast(g.mul(other), self.sizes());
+    Tensor gb = reduce_grad_for_broadcast(g.mul(self), other.sizes());
+    return {ga, gb};
+}
+
+std::vector<Tensor> DivBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor ga = reduce_grad_for_broadcast(g.div(other), self.sizes());
+    Tensor neg_self = self.neg();
+    Tensor other_sq = other.mul(other);
+    Tensor gb = reduce_grad_for_broadcast(g.mul(neg_self).div(other_sq), other.sizes());
+    return {ga, gb};
+}
+
+std::vector<Tensor> AddScalarBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach()};
+}
+
+std::vector<Tensor> SubScalarBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach()};
+}
+
+std::vector<Tensor> MulScalarBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach().mul_scalar(scalar)};
+}
+
+std::vector<Tensor> DivScalarBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach().div_scalar(scalar)};
+}
+
+std::vector<Tensor> PowScalarBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    return {g.mul(self.pow_scalar(scalar - 1.0f)).mul_scalar(scalar)};
+}
+
+std::vector<Tensor> MmBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor grad_self = g.mm(other.transpose(0, 1));
+    Tensor grad_other = self.transpose(0, 1).mm(g);
+    return {grad_self, grad_other};
+}
+
+std::vector<Tensor> BmmBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor grad_self = g.bmm(other.transpose(1, 2));
+    Tensor grad_other = self.transpose(1, 2).bmm(g);
+    return {grad_self, grad_other};
+}
+
+std::vector<Tensor> SumBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    if (dim == -1) {
+        return {Tensor::ones(self_shape).mul_scalar(g.item())};
+    }
+    // g has dim removed; unsqueeze to restore it, then expand
+    Tensor g_unsq = g.unsqueeze(dim);
+    return {g_unsq.expand(self_shape).contiguous()};
+}
+
+std::vector<Tensor> MeanBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    float count;
+    if (dim == -1) {
+        count = static_cast<float>(Tensor::compute_numel(self_shape));
+        return {Tensor::ones(self_shape).mul_scalar(g.item() / count)};
+    }
+    count = static_cast<float>(self_shape[dim]);
+    Tensor g_unsq = g.unsqueeze(dim);
+    return {g_unsq.expand(self_shape).contiguous().div_scalar(count)};
+}
+
+std::vector<Tensor> ReshapeBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach().reshape(self_shape)};
+}
+
+std::vector<Tensor> TransposeBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach().transpose(dim0, dim1).contiguous()};
+}
+
+std::vector<Tensor> ExpandBackward::apply(const std::vector<Tensor>& grads) {
+    return {reduce_grad_for_broadcast(grads[0].detach(), self_shape)};
+}
+
+std::vector<Tensor> SelectBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor result = Tensor::zeros(self_shape);
+    int n = grads[0].numel();
+    Tensor gc = grads[0].contiguous();
+    const float* gp = gc.data_ptr();
+
+    std::vector<int> idx(grads[0].dim(), 0);
+    for (int i = 0; i < n; ++i) {
+        std::vector<int> full_idx;
+        int gi = 0;
+        for (int d = 0; d < static_cast<int>(self_shape.size()); ++d) {
+            if (d == dim) full_idx.push_back(index);
+            else full_idx.push_back(idx[gi++]);
+        }
+        int off = 0;
+        for (int d = 0; d < static_cast<int>(self_shape.size()); ++d)
+            off += full_idx[d] * result.strides()[d];
+        result.data_ptr()[off] = gp[i];
+
+        for (int d = grads[0].dim() - 1; d >= 0; --d) {
+            if (++idx[d] < grads[0].sizes()[d]) break;
+            idx[d] = 0;
+        }
+    }
+    return {result};
+}
+
+std::vector<Tensor> SliceBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor result = Tensor::zeros(self_shape);
+    Tensor dst = result.slice(dim, start, end, step);
+    dst.copy_(grads[0]);
+    return {result};
+}
+
+std::vector<Tensor> SoftmaxBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor sum_g = g.mul(result).sum(dim).detach();
+    // sum removes the dim; unsqueeze to restore it for broadcasting
+    sum_g = sum_g.unsqueeze(dim);
+    Tensor expanded = sum_g.expand(result.sizes()).contiguous();
+    return {result.mul(g.sub(expanded))};
+}
+
+std::vector<Tensor> LogSoftmaxBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    Tensor softmax_val = result.apply_unary([](float x) { return std::exp(x); });
+    Tensor sum_g = g.sum(dim).detach();
+    sum_g = sum_g.unsqueeze(dim);
+    Tensor expanded = sum_g.expand(result.sizes()).contiguous();
+    return {g.sub(softmax_val.mul(expanded))};
+}
+
+std::vector<Tensor> MaskedFillBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach().clone();
+    int n = g.numel();
+    float* gp = g.data_ptr();
+    Tensor mc = mask.contiguous();
+    const float* mp = mc.data_ptr();
+    for (int i = 0; i < n; ++i)
+        if (mp[i] != 0.0f) gp[i] = 0.0f;
+    return {g};
+}
+
+std::vector<Tensor> EmbeddingBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].contiguous();
+    int embed_dim = g.sizes().back();
+    int n_indices = indices.numel();
+    Tensor result = Tensor::zeros({num_embeddings, embed_dim});
+    float* rp = result.data_ptr();
+    const float* gp = g.data_ptr();
+    Tensor ic = indices.contiguous();
+    const float* ip = ic.data_ptr();
+
+    for (int i = 0; i < n_indices; ++i) {
+        int idx = static_cast<int>(ip[i]);
+        for (int j = 0; j < embed_dim; ++j)
+            rp[idx * embed_dim + j] += gp[i * embed_dim + j];
+    }
+    return {result};
+}
+
+std::vector<Tensor> CrossEntropyBackward::apply(const std::vector<Tensor>& grads) {
+    int N = log_probs.sizes()[0];
+    int C = log_probs.sizes()[1];
+    Tensor softmax_val = log_probs.apply_unary([](float x) { return std::exp(x); });
+    Tensor result = softmax_val.clone();
+    float* rp = result.data_ptr();
+    Tensor tc = targets.contiguous();
+    const float* tp = tc.data_ptr();
+
+    for (int i = 0; i < N; ++i) {
+        int cls = static_cast<int>(tp[i]);
+        rp[i * C + cls] -= 1.0f;
+    }
+    float scale = grads[0].item() / static_cast<float>(N);
+    result.mul_scalar_(scale);
+    return {result};
+}
+
+std::vector<Tensor> CatBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    std::vector<Tensor> result;
+    int offset = 0;
+    for (size_t i = 0; i < split_sizes.size(); ++i) {
+        result.push_back(g.narrow(dim, offset, split_sizes[i]).contiguous());
+        offset += split_sizes[i];
+    }
+    return result;
+}
+
+std::vector<Tensor> UnsqueezeBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach().squeeze(dim)};
+}
+
+std::vector<Tensor> SqueezeBackward::apply(const std::vector<Tensor>& grads) {
+    return {grads[0].detach().reshape(self_shape)};
+}
+
+std::vector<Tensor> PermuteBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor g = grads[0].detach();
+    std::vector<int> inv(order.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        inv[order[i]] = static_cast<int>(i);
+    return {g.permute(inv).contiguous()};
+}
+
+std::vector<Tensor> GELUBackward::apply(const std::vector<Tensor>& grads) {
+    static const float kSqrt2OverPi = std::sqrt(2.0f / 3.14159265358979323846f);
+    int n = self.numel();
+    Tensor result(self.sizes());
+    Tensor sc = self.contiguous();
+    const float* sp = sc.data_ptr();
+    Tensor gc = grads[0].contiguous();
+    const float* gp = gc.data_ptr();
+    float* rp = result.data_ptr();
+
+    for (int i = 0; i < n; ++i) {
+        float x = sp[i];
+        float cube = x * x * x;
+        float inner = kSqrt2OverPi * (x + 0.044715f * cube);
+        float tanh_val = std::tanh(inner);
+        float sech2 = 1.0f - tanh_val * tanh_val;
+        float d_inner = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * x * x);
+        float grad_val = 0.5f * (1.0f + tanh_val) + 0.5f * x * sech2 * d_inner;
+        rp[i] = gp[i] * grad_val;
+    }
+    return {result};
+}
+
+std::vector<Tensor> LayerNormBackward::apply(const std::vector<Tensor>& grads) {
+    Tensor grad_out = grads[0].contiguous();
+    int norm_dim = normalized_dim;
+    int outer = self.numel() / norm_dim;
+
+    Tensor grad_input(self.sizes());
+    Tensor grad_weight = Tensor::zeros({norm_dim});
+    Tensor grad_bias = Tensor::zeros({norm_dim});
+
+    const float* go = grad_out.data_ptr();
+    Tensor sc = self.contiguous();
+    const float* inp = sc.data_ptr();
+    const float* mp = mean.data_ptr();
+    const float* rp = rstd.data_ptr();
+    Tensor wc = weight.contiguous();
+    const float* wp = wc.data_ptr();
+    float* gi = grad_input.data_ptr();
+    float* gw = grad_weight.data_ptr();
+    float* gb = grad_bias.data_ptr();
+
+    for (int i = 0; i < outer; ++i) {
+        const float* go_row = go + i * norm_dim;
+        const float* inp_row = inp + i * norm_dim;
+        float m = mp[i];
+        float rs = rp[i];
+        float* gi_row = gi + i * norm_dim;
+
+        float sum_go_w = 0.0f;
+        float sum_go_w_xhat = 0.0f;
+        for (int j = 0; j < norm_dim; ++j) {
+            float xhat = (inp_row[j] - m) * rs;
+            sum_go_w += go_row[j] * wp[j];
+            sum_go_w_xhat += go_row[j] * wp[j] * xhat;
+            gw[j] += go_row[j] * xhat;
+            gb[j] += go_row[j];
+        }
+
+        float inv_n = 1.0f / norm_dim;
+        for (int j = 0; j < norm_dim; ++j) {
+            float xhat = (inp_row[j] - m) * rs;
+            gi_row[j] = rs * wp[j] * (go_row[j] - inv_n * (sum_go_w + xhat * sum_go_w_xhat));
+        }
+    }
+
+    return {grad_input, grad_weight, grad_bias};
 }
 
 } // namespace minitorch
