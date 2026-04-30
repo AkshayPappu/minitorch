@@ -493,6 +493,10 @@ minitorch/
 - **NN Modules** -- PyTorch-style `Module` base class with recursive parameter collection, child module registration, and train/eval mode switching.
 - **Optimizers** -- First-order optimizers (SGD with momentum, Adam) that operate directly on `Tensor*` parameter pointers.
 
+## Authors
+Akshay Pappu (AkshayPappu)
+Anshul Chiranth (AChiranth)
+
 ## License
 
 MIT
